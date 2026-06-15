@@ -44,8 +44,12 @@ export async function runProactiveTick(env) {
 
     // 🔒 重入锁：Workers scheduled 无重入守卫，tick 超 60s 时下一轮 cron 会并发 → 同一 pair 双发双扣费。
     //    抢不到锁（已有 tick 在跑）就直接退出本轮。锁带 TTL，tick 崩溃也会自动释放。
+    //    ⚠️ TTL 必须 ≥ 单 pair 最长耗时：tool-loop(≤25s 预算) + runGeneration(≤180s) + 余量 → 取 300s。
+    //    旧值 120s < 180s 生成 → 锁会在生成中途过期 → 下轮 cron 抢到锁并发 → 双发隐患复活。
+    //    （CAS claimFireIfStale 仍兜底防同一对双发，长锁是第二道防线 + 防多 pair 重叠空耗。）
+    const TICK_LOCK_TTL_MS = 300_000;
     let lockHeld = false;
-    try { lockHeld = await proactive.acquireTickLock?.(120_000); } catch { lockHeld = true; /* 不支持锁的实现照旧跑 */ }
+    try { lockHeld = await proactive.acquireTickLock?.(TICK_LOCK_TTL_MS); } catch { lockHeld = true; /* 不支持锁的实现照旧跑 */ }
     if (lockHeld === false) {
         return { pairs: 0, fired: 0, skipped: 'locked' };
     }
@@ -85,7 +89,9 @@ export async function runProactiveTick(env) {
             // 走线下剧情中：跳过该 inbox 的所有主动生成（用户在前台沉浸剧情，不该被线上消息打断）
             if (await isInboxPaused(rec.inboxId)) continue;
 
-            // 后端冷却：上次触发太近就跳过（防 1 分钟 cron 连发）
+            // 后端冷却（快照早跳过，省掉后面 verdict/记忆/工具的开销）：用 listEnabled 拍的快照先粗筛。
+            //    ⚠️ 这只是早跳过，不是权威判定——快照可能过期（两轮重叠 cron 都拍到旧值），
+            //    权威判定在生成前用 claimFireIfStale 做 CAS（见下）。
             if (rec.lastFiredAt && (now - rec.lastFiredAt) < BACKEND_FIRE_COOLDOWN_MS) continue;
 
             // 两种触发档：'impulse'(真人模式) / 'interval'(普通后台主动，计时+概率高中低)
@@ -116,12 +122,16 @@ export async function runProactiveTick(env) {
 
             if (!verdict.fire) continue;
 
-            // 🔒 先抢占发送槽：在【生成之前】就把 lastFiredAt 推进到 now 落库。
-            //    根因（重复消息真凶）：旧码 lastFiredAt 在生成【之后】才写，而 runGeneration 可能耗时数十秒，
-            //    期间下一轮 cron 读到旧 lastFiredAt → 冷却闸放行 → 同一对再生成一次 = 下轮重复上轮。
-            //    ⚠️ 必须走独立的 claimFire（写独立 key `pf:`），不能用 patch(整条 blob)：否则手机端
-            //    sync-messages 的 patch 会用抢槽前的快照覆盖回旧 lastFiredAt → 抢槽被抹掉 → 重复消息复活。
-            await proactive.claimFire(rec.inboxId, rec.userId, rec.charId, now);
+            // 🔒 权威条件抢占（CAS）：在【生成之前】新读一次 lastFiredAt，仍在冷却外才抢。
+            //    防三种重复:①旧码生成后才写→慢生成期间下轮重发(claimFire 生成前写已解决)
+            //    ②sync-messages 整条 patch 覆盖抢槽(拆独立 pf: key 已解决)
+            //    ③两轮重叠 cron 各拍 tick 开头快照都过冷却闸→同一对双发(本 CAS 解决:第二轮新读到
+            //      第一轮刚抢的值→claimFireIfStale 返回 false→跳过)。
+            //    写独立 key，不走 patch(整条 blob)，否则会被 sync 覆盖。
+            const claimed = await proactive.claimFireIfStale(
+                rec.inboxId, rec.userId, rec.charId, now, BACKEND_FIRE_COOLDOWN_MS
+            );
+            if (!claimed) continue; // 别的 tick 刚抢了这一对 → 跳过，绝不双发
 
             // 命中 → 实时生成。messages 只有一条 system（手机端拼好的完整 prompt + 填充滑窗）
             let transcript = renderTranscript(rec.recentMessages);

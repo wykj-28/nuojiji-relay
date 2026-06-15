@@ -56,6 +56,16 @@ export class SqliteProactiveStore {
             .run(makePairKey(inboxId, userId, charId), now || Date.now());
         return true;
     }
+    // 🔒 条件抢占（CAS，防两轮重叠 cron 同一对双发）。better-sqlite3 同步执行，进程内真原子。
+    async claimFireIfStale(inboxId, userId, charId, now, cooldownMs) {
+        const key = makePairKey(inboxId, userId, charId);
+        const row = this.db.prepare('SELECT lastFiredAt FROM proactive_fire WHERE pairKey = ?').get(key);
+        const prev = row ? Number(row.lastFiredAt) || 0 : 0;
+        if (prev && (now - prev) < cooldownMs) return false;
+        this.db.prepare('INSERT OR REPLACE INTO proactive_fire (pairKey, lastFiredAt) VALUES (?,?)')
+            .run(key, now || Date.now());
+        return true;
+    }
     async getLastFired(inboxId, userId, charId) {
         const row = this.db.prepare('SELECT lastFiredAt FROM proactive_fire WHERE pairKey = ?')
             .get(makePairKey(inboxId, userId, charId));

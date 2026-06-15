@@ -56,10 +56,12 @@ async function executeToolCall({ namespacedName, args, mcpTools, serversById, ac
     }
 }
 
-async function llmCall({ chatUrl, apiKey, model, body, signal }) {
+async function llmCall({ chatUrl, apiKey, model, body, signal, deadline }) {
     const headers = buildApiHeaders(chatUrl, apiKey);
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), LLM_TIMEOUT_MS);
+    // 超时取 min(单调用上限, 距 deadline 剩余)：避免在 deadline 前夕起的调用还能跑满 60s 冲过预算。
+    const budget = typeof deadline === 'number' ? Math.max(1000, deadline - Date.now()) : LLM_TIMEOUT_MS;
+    const timer = setTimeout(() => controller.abort(), Math.min(LLM_TIMEOUT_MS, budget));
     const onAbort = () => controller.abort();
     if (signal) signal.addEventListener('abort', onAbort);
     try {
@@ -143,7 +145,7 @@ export async function runProactiveToolLoop(mcpToolServers, recentMessages, aiSet
             for (let iter = 0; iter < MAX_TOOL_ITERATIONS; iter++) {
                 if (Date.now() > deadline) break;
                 const data = await llmCall({
-                    chatUrl, apiKey, model,
+                    chatUrl, apiKey, model, deadline,
                     body: {
                         model, system: decisionSystem, messages: working,
                         max_tokens: 1024, ...(temperature != null ? { temperature } : {}),
@@ -170,7 +172,7 @@ export async function runProactiveToolLoop(mcpToolServers, recentMessages, aiSet
             for (let iter = 0; iter < MAX_TOOL_ITERATIONS; iter++) {
                 if (Date.now() > deadline) break;
                 const data = await llmCall({
-                    chatUrl, apiKey, model,
+                    chatUrl, apiKey, model, deadline,
                     body: {
                         model, messages: working,
                         ...(temperature != null ? { temperature } : {}),

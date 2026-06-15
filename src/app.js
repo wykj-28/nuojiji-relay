@@ -351,6 +351,14 @@ export function createApp() {
         if (typeof promptTemplate === 'string' && promptTemplate.length > 256 * 1024) {
             return c.json({ error: 'promptTemplate too large (>256KB)' }, 413);
         }
+        // D：mcpToolServers/mcpContextServers 也封顶（含 cachedTools 的 inputSchema 可能很大），防 KV bloat。
+        for (const [field, val] of [['mcpToolServers', mcpToolServers], ['mcpContextServers', mcpContextServers]]) {
+            if (val != null) {
+                if (Array.isArray(val) && val.length > 32) return c.json({ error: `${field} too many (>32)` }, 413);
+                let sz = 0; try { sz = JSON.stringify(val).length; } catch { /* ignore */ }
+                if (sz > 128 * 1024) return c.json({ error: `${field} too large (>128KB)` }, 413);
+            }
+        }
         const { proactive } = await getStores(c.env);
         await proactive.upsert({
             inboxId, userId: String(userId), charId: String(charId),

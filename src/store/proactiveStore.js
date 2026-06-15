@@ -89,6 +89,15 @@ export class MemoryProactiveStore {
         this.fireMap.set(makePairKey(inboxId, userId, charId), now || Date.now());
         return true;
     }
+    // 🔒 条件抢占（CAS 语义）：只有当前 lastFiredAt 仍在冷却外才抢，返回 true=抢到。
+    //    防「两轮重叠 cron 各拍 tick 开头快照都过冷却闸→同一对双发」：抢槽前【新读】一次,别人刚抢则跳过。
+    async claimFireIfStale(inboxId, userId, charId, now, cooldownMs) {
+        const k = makePairKey(inboxId, userId, charId);
+        const prev = this.fireMap.get(k) || 0;
+        if (prev && (now - prev) < cooldownMs) return false;
+        this.fireMap.set(k, now || Date.now());
+        return true;
+    }
     async getLastFired(inboxId, userId, charId) {
         return this.fireMap.get(makePairKey(inboxId, userId, charId)) || 0;
     }
@@ -185,6 +194,16 @@ class KvProactiveStore {
     //    → 下轮 cron 冷却闸放行 → 重复主动消息。拆开后两个写者各写各的 key，互不覆盖。
     async claimFire(inboxId, userId, charId, now) {
         await this.kv.put(`pf:${makePairKey(inboxId, userId, charId)}`, String(now || Date.now()));
+        return true;
+    }
+    // 🔒 条件抢占（CAS 语义，防两轮重叠 cron 同一对双发）：抢槽前【新读】pf: key，
+    //    仍在冷却外才写。KV 非完全原子(get-then-put)，但窗口从整个 tick 缩到一次读写间，配合长锁趋近零。
+    async claimFireIfStale(inboxId, userId, charId, now, cooldownMs) {
+        const key = `pf:${makePairKey(inboxId, userId, charId)}`;
+        const raw = await this.kv.get(key);
+        const prev = raw ? Number(raw) || 0 : 0;
+        if (prev && (now - prev) < cooldownMs) return false;
+        await this.kv.put(key, String(now || Date.now()));
         return true;
     }
     async getLastFired(inboxId, userId, charId) {
