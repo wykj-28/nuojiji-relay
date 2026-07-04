@@ -19,3 +19,4 @@ binding = "OUTBOX"
 # 不需要主动消息可注释掉这两行。
 [triggers]
 crons = ["* * * * *"]
+workers_dev=true
